@@ -1,4 +1,4 @@
-#include <onnxruntime_cxx_api.h>
+#include <onnxruntime/core/session/onnxruntime_cxx_api.h>
 
 #ifdef DIRECTML
 #include <dml_provider_factory.h>
@@ -24,6 +24,7 @@
 #define ONNX_ERR "ONNX raise exception: "
 #define JSON_ERR "JSON parser raise exception: "
 #define GPU_NOT_SUPPORTED_ERR "This library is CPU version. GPU is not supported."
+#define DML_NOT_SUPPORTED_ERR "This library is not bulit for use with DirectML."
 #define UNKNOWN_STYLE "Unknown style ID: "
 
 constexpr float PHONEME_LENGTH_MINIMAL = 0.01f;
@@ -64,8 +65,9 @@ struct SupportedDevices {
   bool cpu = true;
   bool cuda = false;
   bool dml = false;
+  bool rocm = false;
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(SupportedDevices, cpu, cuda, dml);
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(SupportedDevices, cpu, cuda, dml, rocm);
 
 SupportedDevices get_supported_devices() {
   SupportedDevices devices;
@@ -75,13 +77,22 @@ SupportedDevices get_supported_devices() {
       devices.cuda = true;
     } else if (p == "DmlExecutionProvider") {
       devices.dml = true;
+    } else if (p == "ROCMExecutionProvider") {
+      devices.rocm = true;
     }
   }
   return devices;
 }
 
+enum class DeviceType {
+  CPU,
+  CUDA,
+  DML,
+  ROCM,
+};
+
 struct Status {
-  Status(int model_count, bool use_gpu, int cpu_num_threads)
+  Status(int model_count, DeviceType device_type, int cpu_num_threads)
       : memory_info(Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU)) {
     yukarin_s_list = std::vector<std::optional<Ort::Session>>(model_count);
     yukarin_sa_list = std::vector<std::optional<Ort::Session>>(model_count);
@@ -92,14 +103,27 @@ struct Status {
 
     // 重いモデルはGPUを使ったほうが速い
     heavy_session_options.SetInterOpNumThreads(cpu_num_threads).SetIntraOpNumThreads(cpu_num_threads);
-    if (use_gpu) {
+
+    const OrtCUDAProviderOptions cuda_options;
+    const OrtROCMProviderOptions rocm_options;
+
+    switch (device_type) {
+    case DeviceType::CPU:
+      break;
+    case DeviceType::CUDA:
+      heavy_session_options.AppendExecutionProvider_CUDA(cuda_options);
+      break;
+    case DeviceType::DML:
 #ifdef DIRECTML
       heavy_session_options.DisableMemPattern().SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
       Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_DML(heavy_session_options, 0));
-#else
-      const OrtCUDAProviderOptions cuda_options;
-      heavy_session_options.AppendExecutionProvider_CUDA(cuda_options);
 #endif
+      break;
+    case DeviceType::ROCM:
+      heavy_session_options.AppendExecutionProvider_ROCM(rocm_options);
+      break;
+    default:
+      break;
     }
   }
   /**
@@ -191,17 +215,26 @@ std::pair<int64_t, int64_t> get_model_index_and_speaker_id(int64_t speaker_id) {
 bool initialize(bool use_gpu, int cpu_num_threads, bool load_all_models) {
   initialized = false;
 
+  auto device_type = DeviceType::CPU;
+  auto supported_devices_result = get_supported_devices();
 #ifdef DIRECTML
-  if (use_gpu && !get_supported_devices().dml) {
+  if (use_gpu && !supported_devices_result.dml) {
+    device_type = DeviceType::DML;
+  }
 #else
-  if (use_gpu && !get_supported_devices().cuda) {
+  if (use_gpu && supported_devices_result.cuda) {
+    device_type = DeviceType::CUDA;
+  } else if (use_gpu && supported_devices_result.rocm) {
+    device_type = DeviceType::ROCM;
+  }
 #endif /*DIRECTML*/
+  if (use_gpu && device_type == DeviceType::CPU) {
     error_message = GPU_NOT_SUPPORTED_ERR;
     return false;
   }
   try {
     const int model_count = std::size(VVMODEL_LIST);
-    status = std::make_unique<Status>(model_count, use_gpu, cpu_num_threads);
+    status = std::make_unique<Status>(model_count, device_type, cpu_num_threads);
     if (!status->load_metas()) {
       return false;
     }
